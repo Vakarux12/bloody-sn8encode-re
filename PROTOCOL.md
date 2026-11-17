@@ -1,5 +1,7 @@
 # Bloody A60 (09da:72e7) reverse engineering
 
+> **Update 2026-11-17: the cipher is solved.** Config files and all 287 firmware images are standard AES-128-ECB with one key hardcoded in Bloody7.exe, plus a random 32-bit seed XORed over every dword. See [section 8](#8-cipher-solved-aes-128-ecb--32-bit-seed-2026-11-17) and `decode_config.py`.
+
 Full RE of the A4Tech Bloody A60 mouse and its Bloody7 configuration software.
 
 - Mouse: A60cir, Sonix sensor P3332A, firmware code 0x04EC, firmware version 0x13.
@@ -23,7 +25,7 @@ Feature report ID 7, 64-byte packets. SET_FEATURE the request, GET_FEATURE the r
 
 ```
 request:  [0]=07  [1]=opcode  [2..3]=00  [4]=80 write / 00 read  [5..7]=00  [8..]=data
-reply:    [0..1] echo the request; payload normally starts at [8]
+reply:    [0..1] echo the request, payload normally starts at [8]
 ```
 
 Gotcha: the reply buffer is not cleared between commands. Bytes an opcode does not
@@ -105,8 +107,8 @@ different firmware units depending on context. Read vs write is the byte-4 flag.
 - 40 Hid_/Iom_/Icmd_ units (`units.txt`). The flash units (Hid_flash, Hid_flash_nor,
   Hid_flash_m0) build `07 01/02/2a/2f + addr + len` packets: these are SPI/flash
   commands. Never send them with the write flag unless you intend to reflash.
-- The `Encryption_aes` unit (0x46d09c) encrypts the config file `UsbID.txt`, not the
-  firmware. Its key handling reads `Ini\UsbID.txt`.
+- The `Encryption_aes` unit (0x46d09c) encrypts the config file `UsbID.txt`. The same
+  key and cipher also produced the firmware images (section 8). Its key handling reads `Ini\UsbID.txt`.
 
 ## 5. Firmware files (FW/*.sn8encode5)
 
@@ -132,6 +134,8 @@ different firmware units depending on context. Read vs write is the byte-4 flag.
   plaintext checksum). The 4 bank variants share 890/1552 blocks.
 
 ### What the cipher is NOT (ruled out this pass)
+
+> **Superseded by section 8.** Kept as the research log. The conclusions below are wrong where they disagree with section 8.
 - Not off-the-shelf AES. Bloody7.exe contains **no AES S-box or T-tables** in any
   orientation (forward/inverse, byte-reversed), and imports no bulk crypto
   (no CryptEncrypt/ImportKey/DeriveKey, no BCrypt, only CryptDecodeObject for certs).
@@ -204,6 +208,8 @@ primitive), plaintext NOT recovered. Cheap avenues are exhausted. Options left:
 
 ## 5c. Cipher structure breakthrough (key is only 32 bits)
 
+> **Superseded by section 8.** Kept as the research log. The conclusions below are wrong where they disagree with section 8.
+
 Analysing block-0 of all 256 images (block 0 = `enc(erased-flash fill)`, the per-family
 signature) across the 21 families:
 
@@ -235,6 +241,8 @@ all (not the MCU). The 21 family k32 values are recoverable directly from the si
 once `KeylessTransform(0xFF*16)` is known.
 
 ## 5d. Firmware upgrade path, decryption is NOT in the PC app
+
+> **Superseded by section 8.** Kept as the research log. The conclusions below are wrong where they disagree with section 8.
 
 Traced the actual flash path with radare2 (handles the C++Builder switch tables that
 fool linear objdump):
@@ -330,6 +338,8 @@ alone.
 
 ## 7. Structural swing at the KeylessTransform `T` (2026-11-16), result
 
+> **Superseded by section 8.** Kept as the research log. The conclusions below are wrong where they disagree with section 8.
+
 Took the one remaining offline path: hypothesise concrete simple forms for `T`
 and test them against all 287 locally-held `.sn8encode5` images (script
 `crack.py`). Model under test: `C = M·P ⊕ K_family` (affine over GF(2), 16-byte
@@ -382,3 +392,89 @@ plaintext. Firmware plaintext is therefore **not obtainable** by PC software RE
 or by cryptanalysis of the images, only a hardware MCU dump/glitch (brick/decap
 risk, out of scope) or an externally-supplied genuine decrypted image would
 yield it.
+
+
+## 8. Cipher solved: AES-128-ECB + 32-bit seed (2026-11-17)
+
+Found by static analysis of Bloody7.exe (image base 0x400000, no ASLR). Nothing ran on a device.
+
+### Where it lives
+
+- `0x46d0bc` (UsbID loader) calls ctx init `0x133fb68`, then `0x13411e4` (validate) and
+  `0x1341874`, which calls `0x1341514` (load and decrypt). The save side is `0x13417a0` and
+  `0x1341324`. About 40 call sites use the same unit for macros, gun scripts and settings files.
+- `0x133fb68` sets Nb=4, Nk=4, Nr=10, so this is AES-128. The key comes from `0x133fbd4`:
+  the low byte of each of 16 **dwords** at VA `0x154ad54`.
+- The S-box (`0x154ad94`), inverse S-box (`0x154b194`) and Rcon (`0x154b594`) are the standard
+  FIPS-197 values, but stored **one byte per dword**. That is why every byte-pattern S-box
+  and key search (section 5, `keyscan2.c`) came up empty.
+- `0x1340e14` is the textbook inverse cipher: AddRoundKey `0x133fe74`, InvShiftRows
+  `0x133ffb0`, InvSubBytes `0x133ff14` and InvMixColumns `0x13400c0`. Its output matches OpenSSL
+  AES-128-ECB byte for byte. The encrypt counterpart is `0x1340d44`.
+
+### Config container (`ini/UsbID.txt`, `*.bmc`, `*.bwp`, `*.amc2`, `*.mgn2`, ...)
+
+```
+[ AES-128-ECB_K(plaintext, zero padded) XOR broadcast32(seed) ]
+[ len XOR seed | seed | version | crc32 ]     16-byte trailer, little-endian u32s
+```
+
+- `crc32` is zlib CRC-32 over everything except its own 4 bytes (`0x1340f8c`).
+  `version` is 0x01010101 to 0x01010104.
+- `0x1340ee4` XORs every dword of the body and the length field with `seed`.
+- The seed is generated at save time (`0x1341403`): `srand(time(0))`, then
+  `seed = ((rand() & 0xFFFF) << 12) + (rand() & 0xFFFF)`. That makes it a random nonce below
+  0x10000000, stored in clear. It is not a key.
+- The plaintext is a UTF-16LE UnicodeString. `UsbID.txt` turns out to be only a VID/PID list:
+
+```
+[StrictControl]
+VidPid1=09DA,5499,09DA,549A
+VidPid2=09DA,3E74,09DA,3E75
+...
+VidPid12=09DA,131B,09DA,38D
+```
+
+### Firmware container (`*.sn8encode5`)
+
+```
+[ AES-128-ECB_K(image) XOR broadcast32(seed) ] [ seed ]      4-byte trailer, little-endian
+```
+
+This uses the same key, with the seed alone as the trailer. Mapping it onto the old model in section 5c:
+
+- `KeylessTransform` = `AES_K`, and the "per-family k32" is the seed. Re-encrypting with
+  the original seed reproduces every image byte for byte.
+- The repeated header block is **AES_K(0x00 x 16)**, not the 0xFF fill assumed earlier.
+  `AES_K(0^16) = f61b8d95 5117054b 3e347097 2f9dec6e` has lane deltas
+  `a70c88de / c82ffd02 / d98661fb`, exactly the universal fingerprint, and
+  `sig XOR AES_K(0^16)` is lane-periodic in 287/287 images.
+- All 26 distinct seeds are below 0x10000000, which matches the app's `rand()` construction. It also
+  explains why every family's word0 started with 0x9: that is 0xf6 XOR a seed whose top nibble is 0.
+- Section 7's "affine-linear `M`" inference was wrong. Lane-periodicity of the signature XORs
+  comes from the XOR applied on the **output**, which holds for any transform, AES included.
+
+### Decrypted firmware
+
+The plaintext is Sonix SN8 code (SN8F2288 family for the USB mice). For
+`Acir2_P3332A_0B8_0_44`, entropy drops from 7.12 to 4.82. The first 0x300 bytes are zero.
+File word 0x180 holds the vector table, and flash address = file word - 0x80:
+
+- `JMP 0x016C` goes to the reset stub: `B0BCLR STKP.7, MOV A,#07h, B0MOV STKP,A, MOV A,#5Ah,
+  B0MOV WDTR,A, CALL 0x0646, CALL 0x011F, CALL 0x0109`.
+- `CALL 0x011F` lands on the USB init: `B0MOV USTATUS/UE0R..UE3R/UDP0/UPID, A`, with EP2/3/4
+  FIFO at 18h/28h/38h.
+- `JMP 0x0139` lands on the ISR prologue (`PUSH`, save RBANK/R/Z/Y, test `INTRQ.6`).
+
+The flash addresses 0x000 to 0x0FF (probably the bootloader) are not part of the image. Every
+image disassembles as SN8 code (the undecodable words are data tables). The last 8 bytes before
+the zero padding are not a plain sum or CRC and are still unexplained. The plaintext images are
+A4Tech's and are not included here.
+
+### Tools
+
+- `decode_config.py`: pure Python, no dependencies. It decrypts config containers and
+  `.sn8encode5` firmware and self-checks against FIPS-197 and the firmware check value. The key
+  is cached in `bloody7.key`. If that file is missing it is pulled from your Bloody7.exe (`--exe`).
+- `keyscan3.c`: the corrected crib scanner, testing lane-periodicity of `AES_K(fill) XOR sig` over
+  contiguous and strided key candidates. Given a synthetic signature it re-finds the key at VA 0x154ad54.

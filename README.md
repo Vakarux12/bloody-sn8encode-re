@@ -1,77 +1,71 @@
 # A4Tech Bloody (Sonix SN8) reverse engineering
 
 Reverse engineering of A4Tech **Bloody** mice and the **Bloody7** configuration
-software, from Linux. Two things are documented here:
+software, from Linux. This repo documents three things:
 
-1. **The vendor HID config protocol**, fully usable with no driver needed. A small
-   Linux userspace tool (`bloody.py`) reads model/firmware info, sets backlight,
-   and sweeps the opcode map over HID feature report 7.
-2. **The `.sn8encode5` firmware cipher**, structurally cracked but **not yet
-   invertible**. This is the open problem. See below if you want to continue it.
+1. **The vendor HID config protocol**, usable with no driver. A small Linux userspace
+   tool (`bloody.py`) reads model/firmware info, sets backlight, and sweeps the opcode
+   map over HID feature report 7.
+2. **The Bloody7 file cipher, solved.** Config and data files (`ini/UsbID.txt`, macro
+   and gun scripts) are AES-128-ECB with one key hardcoded in Bloody7.exe.
+3. **The `.sn8encode5` firmware cipher, solved.** It is the same AES-128 key and cipher.
+   All 287 firmware images shipped with Bloody7 decrypt to Sonix SN8 machine code.
 
-Target device during this work: **Bloody A60cir, USB `09da:72e7`, Sonix SN8 MCU,
-sensor P3332A**. The protocol findings generalise across the Bloody7 lineup. The
-cipher analysis covers all 287 `.sn8encode5` images shipped in Bloody7.
+Target device during this work: **Bloody A60cir / Acir2, USB `09da:72e7`, Sonix SN8 MCU,
+sensor P3332A**. The protocol findings generalise across the Bloody7 lineup.
 
-Full writeup: **[`PROTOCOL.md`](PROTOCOL.md)**.
+Full writeup: **[`PROTOCOL.md`](PROTOCOL.md)**, cipher details in section 8.
 
-## The firmware cipher, in one paragraph
-
-Each `.sn8encode5` image is a Sonix SN8 firmware encrypted as **16-byte ECB**:
+## The cipher, in one paragraph
 
 ```
-cipher_block = M · plaintext_block  XOR  broadcast(k32_family)
+file_block = AES-128-ECB_K(plaintext_block) XOR broadcast32(seed)
 ```
 
-- `M` (the "KeylessTransform") is an **affine-linear 128x128 GF(2) transform shared
-  by every model**, confirmed fleet-wide: every pairwise family-signature XOR is
-  lane-periodic, which a non-linear map could not produce.
-- The entire per-family key is a single **32-bit word** `k32`, broadcast into each
-  of the four 32-bit lanes.
-- Universal, family-independent inter-lane delta of the erased-fill signature,
-  `lane_i XOR lane_0 = (0, a70c88de, c82ffd02, d98661fb)`, holding in **287/287**
-  images.
-- Second universal anchor: `U = sig XOR (2nd-most-common block) =
-  ffec107d 28faf523 232462e5 25b97391` (205/287 images).
+`K` is 16 bytes stored as 16 dwords at VA `0x154ad54` in Bloody7.exe, next to an AES
+S-box that is also stored one byte per dword. That layout is why byte-level S-box and
+key scans never found it. `seed` is a random 28-bit nonce from `srand(time)/rand()` and is
+stored **in clear**: it is the 4-byte trailer of each `.sn8encode5`, and the second word of
+the 16-byte `len|seed|version|crc32` trailer of config files. The repeated block at the
+start of every firmware image is `AES_K(0x00 x 16)` XOR the seed. Its lane structure is the
+"universal inter-lane delta" `(0, a70c88de, c82ffd02, d98661fb)` from the earlier analysis.
 
-### Why it is not yet decryptable (the open problem)
+```sh
+python3 decode_config.py path/to/ini/UsbID.txt                # prints the INI text
+python3 decode_config.py path/to/X.sn8encode5 -o X.bin        # raw SN8 image
+python3 sn8dis.py SN8F2288 X.bin X.asm                         # any SN8 disassembler
+```
 
-Inverting the scheme needs `M`, which is 16384 unknown bits. Recovering a 128-input
-linear map requires about 128 independent **known-plaintext** blocks. We have
-exactly **one** known-plaintext value, the erased-flash fill `0xFF*16`, which
-encrypts to the per-family signature block. Constant-byte blocks (the only other
-"guessable" inputs) span at most an 8-dimensional subspace. So the system is
-under-determined by over 16000 bits, and brute force is hopeless (the secret is a
-matrix, not a short key, so roughly 2^716 even if `M` is merely a bit-permutation).
-Independent evidence (a memory dump of the running app, and disassembly of the
-upgrade path) shows the **PC software never decrypts firmware**. The SN8 MCU almost
-certainly decrypts on-chip with an eFuse-held key, matching the Sonix SNC73xx
-precedent. Details and dead-ends are in `PROTOCOL.md` sections 5 to 7.
+The key is cached in `bloody7.key`. If that file is missing, `decode_config.py` pulls the key
+from your own copy of Bloody7.exe (`--exe path/to/Bloody7.exe`) and checks it against the
+firmware check value before use.
 
-### How to continue
+### What was wrong before
 
-The one thing that breaks it wide open: **a single genuine decrypted image** (or
-any ~128 independent known-plaintext/ciphertext block pairs). With that, `crack.py`
-can be extended to solve `M` by Gaussian elimination over GF(2), and every image in
-that family then decrypts. Candidate sources of known plaintext:
+The earlier writeup (sections 5 to 7, kept as a research log) concluded that the firmware
+transform was an unknown affine-linear 128x128 matrix living only in the MCU. Two wrong
+assumptions caused that:
 
-- A hardware MCU dump/glitch of the SN8 (cf. SonixQMK `sonix_dumper`). Invasive,
-  risk of bricking, out of scope here.
-- A leaked or official decrypted image or SDK.
-- Any structural insight that pins `M` with fewer than 128 equations. The
-  per-byte-matrix form is already **ruled out**, because `U` is not byte-periodic.
+- **Wrong fill.** The erased-fill plaintext was taken as `0xFF x 16`, but it is `0x00 x 16`.
+- **Wrong crib.** The AES key scan demanded `AES_K(fill) == signature`. The seed XOR always
+  breaks that match. The right test is "`AES_K(fill) XOR signature` is lane-periodic"
+  (`keyscan3.c`).
 
-Issues and PRs welcome if you get further.
+Lane-periodic family XORs prove only that the key is applied on the output. They do not prove the
+transform is linear. The PC still ships the encrypted blob to the device unchanged, so the
+MCU's bootloader does the decrypting, but with the app's own key.
 
 ## Tools
 
 | File | What it does |
 |---|---|
+| `decode_config.py` | Pure Python, no dependencies. Decrypts Bloody7 config/data files and `.sn8encode5` firmware, and re-encrypts firmware (round trip verified on every image). |
+| `bloody7.key` | Cached AES-128 key (hex). Delete it to re-derive the key from your Bloody7.exe. |
 | `bloody.py` | Linux userspace tool for the live mouse (info, backlight, opcode sweep, raw). No driver, talks HID feature report 7. |
 | `test_bloody.py` | Offline self-check for `bloody.py`'s packet builder. |
 | `analyze_fw.py` | Block-structure analyzer for `.sn8encode*` images (signatures, repeats, trailers). |
-| `crack.py` | Fleet-wide cipher structural analysis (the section 7 result): confirms affine-linearity, the universal deltas and anchors, and quantifies why `M` is under-determined. |
-| `keyscan2.c` | Brute scanner that tried every 16/32-byte window of the exe and firmware as an AES key (straight and byte-reversed). Zero hits, so AES is ruled out. |
+| `keyscan3.c` | AES key scanner with the correct crib (contiguous and 16/32-bit strided keys). |
+| `crack.py`, `keyscan2.c` | Historical. The structural analysis and exact-match key scan behind the old conclusion. |
 | `units.txt` | The 40 `Hid_/Iom_/Icmd_` firmware units recovered from the binary, with addresses. |
 | `probe_read.json` | Raw replies from the live-device opcode sweep. |
 
@@ -79,26 +73,22 @@ Issues and PRs welcome if you get further.
 # live mouse (plug in a Bloody, add the udev rule in PROTOCOL.md section 1 for non-root)
 python3 bloody.py info
 python3 bloody.py dump
-
-# firmware images (get them from the official Bloody7 installer, see below)
-python3 analyze_fw.py path/to/*.sn8encode5
-python3 crack.py        # expects the FW/ tree next to it, edit the glob paths
 ```
 
 ## Firmware images are NOT included
 
-The `.sn8encode5` blobs are A4Tech's copyrighted files and are **not redistributed
-here**. Get them yourself from the official **Bloody7** installer
+The `.sn8encode5` blobs and their decrypted plaintexts are A4Tech's copyrighted files and
+are **not redistributed here**. Get them from the official **Bloody7** installer
 (`Bloody7_V2026.xxxx_MUI.exe`) from a4tech.com. After install they live under
-`...\Bloody7\FW\**\*.sn8encode5`. `crack.py` and `analyze_fw.py` take them as input.
+`...\Bloody7\FW\**\*.sn8encode5`.
 
 ## Scope and ethics
 
-This is interoperability and security research on hardware the author owns. It does
-not distribute vendor firmware or any working decryptor (none exists, that is the
-open problem). Nothing here flashes or modifies device firmware.
+This is interoperability and security research on hardware the author owns. Nothing here
+flashes or modifies device firmware. Writing a modified image to a mouse can brick it, and
+the integrity check the bootloader applies is not yet understood.
 
 ## License
 
-Code and docs in this repo: MIT (see `LICENSE`). Does not cover A4Tech firmware,
-which is not included.
+Code and docs in this repo: MIT (see `LICENSE`). Does not cover A4Tech firmware, which is
+not included.
